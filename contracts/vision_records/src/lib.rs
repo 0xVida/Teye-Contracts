@@ -286,18 +286,21 @@ impl VisionRecordsContract {
     }
 
     /// Get multiple vision records by ID
-    pub fn get_records(env: Env, record_ids: Vec<u64>) -> Vec<VisionRecord> {
+    pub fn get_records(
+        env: Env,
+        record_ids: Vec<u64>,
+    ) -> Result<Vec<VisionRecord>, ContractError> {
         let mut records = Vec::new(&env);
         for id in record_ids.iter() {
-            if let Some(record) = env
+            let key = (symbol_short!("RECORD"), id);
+            let record = env
                 .storage()
                 .persistent()
-                .get::<_, VisionRecord>(&(symbol_short!("RECORD"), id))
-            {
-                records.push_back(record);
-            }
+                .get::<_, VisionRecord>(&key)
+                .ok_or(ContractError::RecordNotFound)?;
+            records.push_back(record);
         }
-        records
+        Ok(records)
     }
 
     /// Get all records for a patient
