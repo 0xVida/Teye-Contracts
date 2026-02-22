@@ -624,6 +624,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fhir"
+version = "1.2.2"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
