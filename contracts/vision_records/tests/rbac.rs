@@ -208,7 +208,7 @@ fn test_record_factory_creates_default_data() {
         &patient,
         &provider,
         vision_records::RecordType::Diagnosis,
-        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
+        "e3b0c44298fc1c149afbf4c8996fb924",
     );
     let record = ctx.client.get_record(&provider, &id);
     assert_eq!(record.id, id);

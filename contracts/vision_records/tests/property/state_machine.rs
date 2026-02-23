@@ -96,7 +96,7 @@ proptest! {
         );
 
         // Provider adds a record for the patient
-        let hash = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
+        let hash = String::from_str(&env, "lifecycle_hash_value_ffffffffffff");
         let record_id = client.add_record(
             &provider,
             &patient,
