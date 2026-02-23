@@ -7,6 +7,7 @@ pub mod emergency;
 pub mod errors;
 pub mod events;
 pub mod provider;
+pub mod rate_limit;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
@@ -19,6 +20,7 @@ pub use errors::{
     create_error_context, log_error, ContractError, ErrorCategory, ErrorLogEntry, ErrorSeverity,
 };
 pub use provider::{Certification, License, Location, Provider, VerificationStatus};
+pub use rate_limit::{RateLimitConfig, RateLimitStats, RateLimitStatus};
 
 /// Storage keys for the contract
 const ADMIN: Symbol = symbol_short!("ADMIN");
@@ -192,6 +194,36 @@ impl VisionRecordsContract {
     ) -> Result<(), ContractError> {
         caller.require_auth();
 
+        // Check rate limit
+        let operation = String::from_str(&env, "register_user");
+        let (allowed, current_count, max_requests, reset_at) =
+            rate_limit::check_rate_limit(&env, &caller, &operation);
+        if !allowed {
+            events::publish_rate_limit_exceeded(
+                &env,
+                caller.clone(),
+                operation,
+                current_count,
+                max_requests,
+                reset_at,
+            );
+            let context = create_error_context(
+                &env,
+                ContractError::RateLimitExceeded,
+                Some(caller.clone()),
+                Some(String::from_str(&env, "register_user")),
+            );
+            log_error(
+                &env,
+                ContractError::RateLimitExceeded,
+                Some(caller),
+                None,
+                None,
+            );
+            events::publish_error(&env, ContractError::RateLimitExceeded as u32, context);
+            return Err(ContractError::RateLimitExceeded);
+        }
+
         if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
             let resource_id = String::from_str(&env, "register_user");
             let context = create_error_context(
@@ -271,6 +303,36 @@ impl VisionRecordsContract {
         data_hash: String,
     ) -> Result<u64, ContractError> {
         caller.require_auth();
+
+        // Check rate limit
+        let operation = String::from_str(&env, "add_record");
+        let (allowed, current_count, max_requests, reset_at) =
+            rate_limit::check_rate_limit(&env, &caller, &operation);
+        if !allowed {
+            events::publish_rate_limit_exceeded(
+                &env,
+                caller.clone(),
+                operation,
+                current_count,
+                max_requests,
+                reset_at,
+            );
+            let context = create_error_context(
+                &env,
+                ContractError::RateLimitExceeded,
+                Some(caller.clone()),
+                Some(String::from_str(&env, "add_record")),
+            );
+            log_error(
+                &env,
+                ContractError::RateLimitExceeded,
+                Some(caller),
+                None,
+                None,
+            );
+            events::publish_error(&env, ContractError::RateLimitExceeded as u32, context);
+            return Err(ContractError::RateLimitExceeded);
+        }
 
         let has_perm = if caller == provider {
             rbac::has_permission(&env, &caller, &Permission::WriteRecord)
@@ -361,6 +423,36 @@ impl VisionRecordsContract {
         record_id: u64,
     ) -> Result<VisionRecord, ContractError> {
         caller.require_auth();
+
+        // Check rate limit
+        let operation = String::from_str(&env, "get_record");
+        let (allowed, current_count, max_requests, reset_at) =
+            rate_limit::check_rate_limit(&env, &caller, &operation);
+        if !allowed {
+            events::publish_rate_limit_exceeded(
+                &env,
+                caller.clone(),
+                operation,
+                current_count,
+                max_requests,
+                reset_at,
+            );
+            let context = create_error_context(
+                &env,
+                ContractError::RateLimitExceeded,
+                Some(caller.clone()),
+                Some(String::from_str(&env, "get_record")),
+            );
+            log_error(
+                &env,
+                ContractError::RateLimitExceeded,
+                Some(caller),
+                None,
+                None,
+            );
+            events::publish_error(&env, ContractError::RateLimitExceeded as u32, context);
+            return Err(ContractError::RateLimitExceeded);
+        }
 
         let key = (symbol_short!("RECORD"), record_id);
         match env.storage().persistent().get::<_, VisionRecord>(&key) {
@@ -466,6 +558,36 @@ impl VisionRecordsContract {
         duration_seconds: u64,
     ) -> Result<(), ContractError> {
         caller.require_auth();
+
+        // Check rate limit
+        let operation = String::from_str(&env, "grant_access");
+        let (allowed, current_count, max_requests, reset_at) =
+            rate_limit::check_rate_limit(&env, &caller, &operation);
+        if !allowed {
+            events::publish_rate_limit_exceeded(
+                &env,
+                caller.clone(),
+                operation,
+                current_count,
+                max_requests,
+                reset_at,
+            );
+            let context = create_error_context(
+                &env,
+                ContractError::RateLimitExceeded,
+                Some(caller.clone()),
+                Some(String::from_str(&env, "grant_access")),
+            );
+            log_error(
+                &env,
+                ContractError::RateLimitExceeded,
+                Some(caller),
+                None,
+                None,
+            );
+            events::publish_error(&env, ContractError::RateLimitExceeded as u32, context);
+            return Err(ContractError::RateLimitExceeded);
+        }
 
         let has_perm = if caller == patient {
             true // Patient manages own access
@@ -783,6 +905,21 @@ impl VisionRecordsContract {
 
         // Status index is updated automatically in set_provider
         provider::set_provider(&env, &provider_data);
+
+        // Grant rate limit bypass for verified providers
+        if status == VerificationStatus::Verified {
+            rate_limit::set_rate_limit_bypass(&env, &provider, true);
+            events::publish_rate_limit_bypass_updated(&env, provider.clone(), true, caller.clone());
+        } else {
+            // Remove bypass if status changes from Verified to something else
+            rate_limit::set_rate_limit_bypass(&env, &provider, false);
+            events::publish_rate_limit_bypass_updated(
+                &env,
+                provider.clone(),
+                false,
+                caller.clone(),
+            );
+        }
 
         events::publish_provider_verified(&env, provider, caller, status);
 
@@ -2157,6 +2294,98 @@ impl VisionRecordsContract {
     /// Retrieves recent audit entries (last N entries).
     pub fn get_recent_audit_log(env: Env, limit: u64) -> Vec<AuditEntry> {
         audit::get_recent_audit_log(&env, limit)
+    }
+
+    // ── Rate Limiting Functions ────────────────────────────────────────────────
+
+    /// Sets rate limit configuration for an operation
+    pub fn set_rate_limit_config(
+        env: Env,
+        caller: Address,
+        operation: String,
+        max_requests: u32,
+        window_seconds: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            let context = create_error_context(
+                &env,
+                ContractError::Unauthorized,
+                Some(caller.clone()),
+                Some(String::from_str(&env, "set_rate_limit_config")),
+            );
+            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
+            events::publish_error(&env, ContractError::Unauthorized as u32, context);
+            return Err(ContractError::Unauthorized);
+        }
+
+        let config = RateLimitConfig {
+            max_requests,
+            window_seconds,
+            operation: operation.clone(),
+        };
+        rate_limit::set_rate_limit_config(&env, &config);
+        events::publish_rate_limit_config_updated(
+            &env,
+            operation,
+            max_requests,
+            window_seconds,
+            caller,
+        );
+
+        Ok(())
+    }
+
+    /// Gets rate limit configuration for an operation
+    pub fn get_rate_limit_config(env: Env, operation: String) -> Option<RateLimitConfig> {
+        rate_limit::get_rate_limit_config(&env, &operation)
+    }
+
+    /// Gets rate limit status for an address and operation
+    pub fn get_rate_limit_status(
+        env: Env,
+        address: Address,
+        operation: String,
+    ) -> Option<RateLimitStatus> {
+        rate_limit::get_rate_limit_status(&env, &address, &operation)
+    }
+
+    /// Sets rate limit bypass for an address (admin only)
+    pub fn set_rate_limit_bypass(
+        env: Env,
+        caller: Address,
+        address: Address,
+        bypass: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            let context = create_error_context(
+                &env,
+                ContractError::Unauthorized,
+                Some(caller.clone()),
+                Some(String::from_str(&env, "set_rate_limit_bypass")),
+            );
+            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
+            events::publish_error(&env, ContractError::Unauthorized as u32, context);
+            return Err(ContractError::Unauthorized);
+        }
+
+        rate_limit::set_rate_limit_bypass(&env, &address, bypass);
+        events::publish_rate_limit_bypass_updated(&env, address, bypass, caller);
+
+        Ok(())
+    }
+
+    /// Checks if an address has rate limit bypass
+    pub fn has_rate_limit_bypass(env: Env, address: Address) -> bool {
+        rate_limit::has_rate_limit_bypass(&env, &address)
+    }
+
+    /// Gets all rate limit configurations
+    pub fn get_all_rate_limit_configs(env: Env) -> Vec<RateLimitConfig> {
+        rate_limit::get_all_rate_limit_configs(&env)
     }
 }
 

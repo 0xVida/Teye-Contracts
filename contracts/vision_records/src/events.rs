@@ -624,3 +624,93 @@ pub fn publish_audit_log_entry(env: &Env, entry: &AuditEntry) {
     };
     env.events().publish(topics, data);
 }
+
+/// Event published when rate limit is exceeded.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitExceededEvent {
+    pub address: Address,
+    pub operation: String,
+    pub current_count: u32,
+    pub max_requests: u32,
+    pub reset_at: u64,
+    pub timestamp: u64,
+}
+
+/// Event published when rate limit configuration is updated.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitConfigUpdatedEvent {
+    pub operation: String,
+    pub max_requests: u32,
+    pub window_seconds: u64,
+    pub updated_by: Address,
+    pub timestamp: u64,
+}
+
+/// Event published when rate limit bypass is granted or revoked.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitBypassUpdatedEvent {
+    pub address: Address,
+    pub bypass_enabled: bool,
+    pub updated_by: Address,
+    pub timestamp: u64,
+}
+
+/// Publishes a rate limit exceeded event.
+pub fn publish_rate_limit_exceeded(
+    env: &Env,
+    address: Address,
+    operation: String,
+    current_count: u32,
+    max_requests: u32,
+    reset_at: u64,
+) {
+    let topics = (symbol_short!("RL_EXCD"), address.clone(), operation.clone());
+    let data = RateLimitExceededEvent {
+        address: address.clone(),
+        operation: operation.clone(),
+        current_count,
+        max_requests,
+        reset_at,
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
+
+/// Publishes a rate limit configuration updated event.
+pub fn publish_rate_limit_config_updated(
+    env: &Env,
+    operation: String,
+    max_requests: u32,
+    window_seconds: u64,
+    updated_by: Address,
+) {
+    let topics = (symbol_short!("RL_CONFIG"), operation.clone());
+    let data = RateLimitConfigUpdatedEvent {
+        operation: operation.clone(),
+        max_requests,
+        window_seconds,
+        updated_by: updated_by.clone(),
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
+
+/// Publishes a rate limit bypass updated event.
+pub fn publish_rate_limit_bypass_updated(
+    env: &Env,
+    address: Address,
+    bypass_enabled: bool,
+    updated_by: Address,
+) {
+    let topics = (symbol_short!("RL_BYPASS"), address.clone());
+    let data = RateLimitBypassUpdatedEvent {
+        address: address.clone(),
+        bypass_enabled,
+        updated_by: updated_by.clone(),
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
