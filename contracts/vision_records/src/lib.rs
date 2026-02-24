@@ -1,4 +1,5 @@
 #![no_std]
+mod events;
 pub mod rbac;
 pub mod validation;
 
@@ -7,18 +8,25 @@ pub mod audit;
 pub mod emergency;
 pub mod errors;
 pub mod events;
+pub mod examination;
 pub mod provider;
 pub mod rate_limit;
 
+pub mod patient_profile;
+
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
+    Symbol, Vec,
 };
 
-pub use appointment::{Appointment, AppointmentHistoryEntry, AppointmentStatus, AppointmentType};
-pub use audit::{AccessAction, AccessResult, AuditEntry};
-pub use emergency::{EmergencyAccess, EmergencyAuditEntry, EmergencyCondition, EmergencyStatus};
+use crate::patient_profile::{EmergencyContact, InsuranceInfo, PatientProfile};
 pub use errors::{
     create_error_context, log_error, ContractError, ErrorCategory, ErrorLogEntry, ErrorSeverity,
+};
+pub use examination::{
+    EyeExamination, FundusPhotography, IntraocularPressure, OptFundusPhotography,
+    OptPhysicalMeasurement, OptRetinalImaging, OptVisualField, PhysicalMeasurement, RetinalImaging,
+    SlitLampFindings, VisualAcuity, VisualField,
 };
 pub use provider::{Certification, License, Location, Provider, VerificationStatus};
 pub use rate_limit::{RateLimitConfig, RateLimitStats, RateLimitStatus};
@@ -26,6 +34,8 @@ pub use rate_limit::{RateLimitConfig, RateLimitStats, RateLimitStatus};
 /// Storage keys for the contract
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const INITIALIZED: Symbol = symbol_short!("INIT");
+const RATE_CFG: Symbol = symbol_short!("RL_CFG");
+const RATE_TRACK: Symbol = symbol_short!("RL_TRK");
 
 const TTL_THRESHOLD: u32 = 5184000;
 const TTL_EXTEND_TO: u32 = 10368000;
@@ -123,11 +133,78 @@ pub struct AccessGrant {
     pub expires_at: u64,
 }
 
+/// Input for batch record creation
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRecordInput {
+    pub patient: Address,
+    pub record_type: RecordType,
+    pub data_hash: String,
+}
+
+/// Input for batch access grants
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchGrantInput {
+    pub grantee: Address,
+    pub level: AccessLevel,
+    pub duration_seconds: u64,
+}
+
+/// Contract errors
+#[contracterror]
+#[derive(Clone, Debug, Eq, PartialEq, Copy)]
+#[repr(u32)]
+pub enum ContractError {
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    Unauthorized = 3,
+    UserNotFound = 4,
+    RecordNotFound = 5,
+    InvalidInput = 6,
+    AccessDenied = 7,
+    Paused = 8,
+}
+
 #[contract]
 pub struct VisionRecordsContract;
 
 #[contractimpl]
 impl VisionRecordsContract {
+    fn enforce_rate_limit(env: &Env, caller: &Address) -> Result<(), ContractError> {
+        let cfg: Option<(u64, u64)> = env.storage().instance().get(&RATE_CFG);
+        let (max_requests_per_window, window_duration_seconds) = match cfg {
+            Some(c) => c,
+            None => return Ok(()), // No config set -> unlimited
+        };
+
+        if max_requests_per_window == 0 || window_duration_seconds == 0 {
+            // Explicitly disabled
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        let key = (RATE_TRACK, caller.clone());
+
+        let mut state: (u64, u64) = env.storage().persistent().get(&key).unwrap_or((0, now));
+
+        let window_end = state.1.saturating_add(window_duration_seconds);
+        if now >= window_end {
+            state.0 = 0;
+            state.1 = now;
+        }
+
+        let next = state.0.saturating_add(1);
+        if next > max_requests_per_window {
+            return Err(ContractError::RateLimitExceeded);
+        }
+
+        state.0 = next;
+        env.storage().persistent().set(&key, &state);
+
+        Ok(())
+    }
+
     /// Initialize the contract with an admin address
     pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
         if env.storage().instance().has(&INITIALIZED) {
@@ -155,6 +232,9 @@ impl VisionRecordsContract {
         rbac::assign_role(&env, admin.clone(), Role::Admin, 0);
 
         // Bootstrap the admin with the Admin role so they can register other users
+        rbac::assign_role(&env, admin.clone(), Role::Admin, 0);
+
+        // Assign the Admin RBAC role so the admin has permissions
         rbac::assign_role(&env, admin.clone(), Role::Admin, 0);
 
         events::publish_initialized(&env, admin);
@@ -185,6 +265,39 @@ impl VisionRecordsContract {
         env.storage().instance().has(&INITIALIZED)
     }
 
+    /// Configure per-address rate limiting for this contract.
+    pub fn set_rate_limit_config(
+        env: Env,
+        caller: Address,
+        max_requests_per_window: u64,
+        window_duration_seconds: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        if max_requests_per_window == 0 || window_duration_seconds == 0 {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let admin = Self::get_admin(env.clone())?;
+        let has_system_admin = rbac::has_permission(&env, &caller, &Permission::SystemAdmin);
+
+        if caller != admin && !has_system_admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        env.storage().instance().set(
+            &RATE_CFG,
+            &(max_requests_per_window, window_duration_seconds),
+        );
+
+        Ok(())
+    }
+
+    /// Return the current rate limiting configuration, if any.
+    pub fn get_rate_limit_config(env: Env) -> Option<(u64, u64)> {
+        env.storage().instance().get(&RATE_CFG)
+    }
+
     /// Register a new user
     pub fn register_user(
         env: Env,
@@ -193,38 +306,13 @@ impl VisionRecordsContract {
         role: Role,
         name: String,
     ) -> Result<(), ContractError> {
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("REG_USR")),
+        )?;
         caller.require_auth();
 
-        // Check rate limit
-        let operation = String::from_str(&env, "register_user");
-        let (allowed, current_count, max_requests, reset_at) =
-            rate_limit::check_rate_limit(&env, &caller, &operation);
-        if !allowed {
-            events::publish_rate_limit_exceeded(
-                &env,
-                caller.clone(),
-                operation,
-                current_count,
-                max_requests,
-                reset_at,
-            );
-            let context = create_error_context(
-                &env,
-                ContractError::RateLimitExceeded,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "register_user")),
-            );
-            log_error(
-                &env,
-                ContractError::RateLimitExceeded,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(&env, ContractError::RateLimitExceeded as u32, context);
-            return Err(ContractError::RateLimitExceeded);
-        }
-
+        // Unified check: covers direct role, custom grants, and delegated roles
         if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
             let resource_id = String::from_str(&env, "register_user");
             let context = create_error_context(
@@ -262,6 +350,9 @@ impl VisionRecordsContract {
         rbac::assign_role(&env, user.clone(), role.clone(), 0);
 
         // Assign the role in the RBAC system
+        rbac::assign_role(&env, user.clone(), role.clone(), 0);
+
+        // Create the RBAC role assignment so has_permission works
         rbac::assign_role(&env, user.clone(), role.clone(), 0);
 
         events::publish_user_registered(&env, user, role, name);
@@ -305,46 +396,25 @@ impl VisionRecordsContract {
         record_type: RecordType,
         data_hash: String,
     ) -> Result<u64, ContractError> {
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("ADD_REC")),
+        )?;
         caller.require_auth();
 
-        // Check rate limit
-        let operation = String::from_str(&env, "add_record");
-        let (allowed, current_count, max_requests, reset_at) =
-            rate_limit::check_rate_limit(&env, &caller, &operation);
-        if !allowed {
-            events::publish_rate_limit_exceeded(
-                &env,
-                caller.clone(),
-                operation,
-                current_count,
-                max_requests,
-                reset_at,
-            );
-            let context = create_error_context(
-                &env,
-                ContractError::RateLimitExceeded,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "add_record")),
-            );
-            log_error(
-                &env,
-                ContractError::RateLimitExceeded,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(&env, ContractError::RateLimitExceeded as u32, context);
-            return Err(ContractError::RateLimitExceeded);
-        }
+        Self::enforce_rate_limit(&env, &caller)?;
 
         validation::validate_data_hash(&data_hash)?;
 
+        // If caller is the provider, unified check covers direct + delegated WriteRecord.
+        // Otherwise, check if this specific provider delegated to the caller.
         let has_perm = if caller == provider {
             rbac::has_permission(&env, &caller, &Permission::WriteRecord)
         } else {
             rbac::has_delegated_permission(&env, &provider, &caller, &Permission::WriteRecord)
         };
 
+        // Fall back to SystemAdmin (unified: direct role + any delegation)
         if !has_perm && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
             // Log failed write attempt
             let audit_entry = audit::create_audit_entry(
@@ -372,7 +442,7 @@ impl VisionRecordsContract {
 
         // Generate record ID
         let counter_key = symbol_short!("REC_CTR");
-        let record_id: u64 = env.storage().instance().get(&counter_key).unwrap_or(0) + 1;
+        let record_id: u64 = env.storage().instance().get(&counter_key).unwrap_or(0u64).saturating_add(1u64);
         env.storage().instance().set(&counter_key, &record_id);
 
         let record = VisionRecord {
@@ -402,46 +472,94 @@ impl VisionRecordsContract {
             .set(&patient_key, &patient_records);
         extend_ttl_address_key(&env, &patient_key);
 
-        // Log successful write
-        let audit_entry = audit::create_audit_entry(
-            &env,
-            caller.clone(),
-            patient.clone(),
-            Some(record_id),
-            AccessAction::Write,
-            AccessResult::Success,
-            None,
-        );
-        audit::add_audit_entry(&env, &audit_entry);
-        events::publish_audit_log_entry(&env, &audit_entry);
-
-        events::publish_record_added(&env, record_id, patient, provider, record_type);
-
         Ok(record_id)
     }
 
-    /// Get a vision record by ID
-    /// Requires authentication and logs access attempt
-    pub fn get_record(
+    /// Add multiple vision records in a single transaction.
+    /// Validates provider permission once, then creates all records atomically.
+    #[allow(clippy::arithmetic_side_effects)]
+    pub fn add_records(
         env: Env,
-        caller: Address,
-        record_id: u64,
-    ) -> Result<VisionRecord, ContractError> {
-        caller.require_auth();
+        provider: Address,
+        records: Vec<BatchRecordInput>,
+    ) -> Result<Vec<u64>, ContractError> {
+        provider.require_auth();
 
-        // Check rate limit
-        let operation = String::from_str(&env, "get_record");
-        let (allowed, current_count, max_requests, reset_at) =
-            rate_limit::check_rate_limit(&env, &caller, &operation);
-        if !allowed {
-            events::publish_rate_limit_exceeded(
+        if records.is_empty() {
+            return Err(ContractError::InvalidInput);
+        }
+
+        // Check provider has WriteRecord permission once for the whole batch
+        if !rbac::has_permission(&env, &provider, &Permission::WriteRecord)
+            && !rbac::has_permission(&env, &provider, &Permission::SystemAdmin)
+        {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let counter_key = symbol_short!("REC_CTR");
+        let mut current_id: u64 = env.storage().instance().get(&counter_key).unwrap_or(0);
+        let mut record_ids = Vec::new(&env);
+
+        for input in records.iter() {
+            current_id += 1;
+
+            let record = VisionRecord {
+                id: current_id,
+                patient: input.patient.clone(),
+                provider: provider.clone(),
+                record_type: input.record_type.clone(),
+                data_hash: input.data_hash.clone(),
+                created_at: env.ledger().timestamp(),
+                updated_at: env.ledger().timestamp(),
+            };
+
+            let key = (symbol_short!("RECORD"), current_id);
+            env.storage().persistent().set(&key, &record);
+
+            let patient_key = (symbol_short!("PAT_REC"), input.patient.clone());
+            let mut patient_records: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&patient_key)
+                .unwrap_or(Vec::new(&env));
+            patient_records.push_back(current_id);
+            env.storage()
+                .persistent()
+                .set(&patient_key, &patient_records);
+
+            events::publish_record_added(
                 &env,
-                caller.clone(),
-                operation,
-                current_count,
-                max_requests,
-                reset_at,
+                current_id,
+                input.patient.clone(),
+                provider.clone(),
+                input.record_type.clone(),
             );
+
+            record_ids.push_back(current_id);
+        }
+
+        env.storage().instance().set(&counter_key, &current_id);
+
+        events::publish_batch_records_added(&env, provider, record_ids.len());
+
+        Ok(record_ids)
+    }
+
+    /// Get a vision record by ID
+    pub fn get_record(env: Env, record_id: u64) -> Result<VisionRecord, ContractError> {
+        let key = (symbol_short!("RECORD"), record_id);
+        if let Some(record) = env.storage().persistent().get::<_, VisionRecord>(&key) {
+            // Patient can always view own records; admins bypass consent
+            if caller != record.patient
+                && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin)
+            {
+                if !has_active_consent(&env, &record.patient, &caller) {
+                    return Err(ContractError::ConsentRequired);
+                }
+            }
+            Ok(record)
+        } else {
+            let resource_id = String::from_str(&env, "get_record");
             let context = create_error_context(
                 &env,
                 ContractError::RateLimitExceeded,
@@ -543,6 +661,86 @@ impl VisionRecordsContract {
         }
     }
 
+    /// Add eye examination details for an existing record
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_eye_examination(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+        visual_acuity: VisualAcuity,
+        iop: IntraocularPressure,
+        slit_lamp: SlitLampFindings,
+        visual_field: OptVisualField,
+        retina_imaging: OptRetinalImaging,
+        fundus_photo: OptFundusPhotography,
+        clinical_notes: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let record = Self::get_record(env.clone(), record_id)?;
+
+        let has_perm = if caller == record.provider {
+            rbac::has_permission(&env, &caller, &Permission::WriteRecord)
+        } else {
+            rbac::has_delegated_permission(
+                &env,
+                &record.provider,
+                &caller,
+                &Permission::WriteRecord,
+            )
+        };
+
+        if !has_perm && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        if record.record_type != RecordType::Examination {
+            return Err(ContractError::InvalidRecordType);
+        }
+
+        let exam = EyeExamination {
+            record_id,
+            visual_acuity,
+            iop,
+            slit_lamp,
+            visual_field,
+            retina_imaging,
+            fundus_photo,
+            clinical_notes,
+        };
+
+        examination::set_examination(&env, &exam);
+        events::publish_examination_added(&env, record_id);
+
+        Ok(())
+    }
+
+    /// Retrieve eye examination details for a record
+    pub fn get_eye_examination(
+        env: Env,
+        caller: Address,
+        record_id: u64,
+    ) -> Result<EyeExamination, ContractError> {
+        caller.require_auth();
+        let record = Self::get_record(env.clone(), record_id)?;
+
+        let has_perm = if caller == record.patient || caller == record.provider {
+            true
+        } else {
+            let access = Self::check_access(env.clone(), record.patient.clone(), caller.clone());
+            access == AccessLevel::Read
+                || access == AccessLevel::Write
+                || access == AccessLevel::Full
+                || rbac::has_permission(&env, &caller, &Permission::SystemAdmin)
+        };
+
+        if !has_perm {
+            return Err(ContractError::AccessDenied);
+        }
+
+        examination::get_examination(&env, record_id).ok_or(ContractError::RecordNotFound)
+    }
+
     /// Get all records for a patient
     pub fn get_patient_records(env: Env, patient: Address) -> Vec<u64> {
         let key = (symbol_short!("PAT_REC"), patient);
@@ -562,44 +760,22 @@ impl VisionRecordsContract {
         level: AccessLevel,
         duration_seconds: u64,
     ) -> Result<(), ContractError> {
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("GRT_ACC")),
+        )?;
         caller.require_auth();
 
-        // Check rate limit
-        let operation = String::from_str(&env, "grant_access");
-        let (allowed, current_count, max_requests, reset_at) =
-            rate_limit::check_rate_limit(&env, &caller, &operation);
-        if !allowed {
-            events::publish_rate_limit_exceeded(
-                &env,
-                caller.clone(),
-                operation,
-                current_count,
-                max_requests,
-                reset_at,
-            );
-            let context = create_error_context(
-                &env,
-                ContractError::RateLimitExceeded,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "grant_access")),
-            );
-            log_error(
-                &env,
-                ContractError::RateLimitExceeded,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(&env, ContractError::RateLimitExceeded as u32, context);
-            return Err(ContractError::RateLimitExceeded);
-        }
+        Self::enforce_rate_limit(&env, &caller)?;
 
         validation::validate_duration(duration_seconds)?;
 
         let has_perm = if caller == patient {
             true // Patient manages own access
         } else {
+            // Specific patient→caller delegation for ManageAccess
             rbac::has_delegated_permission(&env, &patient, &caller, &Permission::ManageAccess)
+                // Or caller has SystemAdmin (unified: direct + any delegation)
                 || rbac::has_permission(&env, &caller, &Permission::SystemAdmin)
         };
 
@@ -632,26 +808,83 @@ impl VisionRecordsContract {
         env.storage().persistent().set(&key, &grant);
         extend_ttl_access_key(&env, &key);
 
-        // Log successful access grant
-        let audit_entry = audit::create_audit_entry(
-            &env,
-            caller.clone(),
-            patient.clone(),
-            None,
-            AccessAction::GrantAccess,
-            AccessResult::Success,
-            None,
-        );
-        audit::add_audit_entry(&env, &audit_entry);
-        events::publish_audit_log_entry(&env, &audit_entry);
+        // Track the grantee address in the patient's grantee list for purge iteration.
+        let list_key = (symbol_short!("ACC_LST"), patient.clone());
+        let mut grantees: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or(Vec::new(&env));
+        // Avoid duplicates: only append if not already present.
+        let mut found = false;
+        for i in 0..grantees.len() {
+            if grantees.get(i) == Some(grantee.clone()) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            grantees.push_back(grantee.clone());
+            env.storage().persistent().set(&list_key, &grantees);
+        }
 
         events::publish_access_granted(&env, patient, grantee, level, duration_seconds, expires_at);
 
         Ok(())
     }
 
+    /// Grant access to multiple users in a single transaction.
+    /// Patient authorizes once for the entire batch.
+    #[allow(clippy::arithmetic_side_effects)]
+    pub fn grant_access_batch(
+        env: Env,
+        patient: Address,
+        grants: Vec<BatchGrantInput>,
+    ) -> Result<(), ContractError> {
+        patient.require_auth();
+
+        if grants.is_empty() {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let now = env.ledger().timestamp();
+        for grant in grants.iter() {
+            let expires_at = now + grant.duration_seconds;
+            let access_grant = AccessGrant {
+                patient: patient.clone(),
+                grantee: grant.grantee.clone(),
+                level: grant.level.clone(),
+                granted_at: now,
+                expires_at,
+            };
+            let key = (
+                symbol_short!("ACCESS"),
+                patient.clone(),
+                grant.grantee.clone(),
+            );
+            env.storage().persistent().set(&key, &access_grant);
+
+            events::publish_access_granted(
+                &env,
+                patient.clone(),
+                grant.grantee.clone(),
+                grant.level.clone(),
+                grant.duration_seconds,
+                expires_at,
+            );
+        }
+
+        events::publish_batch_access_granted(&env, patient, grants.len());
+
+        Ok(())
+    }
+
     /// Check access level
     pub fn check_access(env: Env, patient: Address, grantee: Address) -> AccessLevel {
+        if !has_active_consent(&env, &patient, &grantee) {
+            return AccessLevel::None;
+        }
+
         let key = (symbol_short!("ACCESS"), patient, grantee);
 
         if let Some(grant) = env.storage().persistent().get::<_, AccessGrant>(&key) {
@@ -670,24 +903,11 @@ impl VisionRecordsContract {
         patient: Address,
         grantee: Address,
     ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        // Verify caller has permission to revoke
-        if caller != patient && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
-            // Log failed revoke attempt
-            let audit_entry = audit::create_audit_entry(
-                &env,
-                caller.clone(),
-                patient.clone(),
-                None,
-                AccessAction::RevokeAccess,
-                AccessResult::Denied,
-                Some(String::from_str(&env, "Insufficient permissions")),
-            );
-            audit::add_audit_entry(&env, &audit_entry);
-            events::publish_audit_log_entry(&env, &audit_entry);
-            return Err(ContractError::Unauthorized);
-        }
+        circuit_breaker::require_not_paused(
+            &env,
+            &circuit_breaker::PauseScope::Function(symbol_short!("REV_ACC")),
+        )?;
+        patient.require_auth();
 
         let key = (symbol_short!("ACCESS"), patient.clone(), grantee.clone());
         env.storage().persistent().remove(&key);
@@ -710,6 +930,70 @@ impl VisionRecordsContract {
         Ok(())
     }
 
+    /// Purge all expired access grants for a given patient.
+    ///
+    /// Only the patient themselves or a SystemAdmin may call this.
+    /// Returns the number of grants removed.
+    pub fn purge_expired_grants(
+        env: Env,
+        caller: Address,
+        patient: Address,
+    ) -> Result<u32, ContractError> {
+        caller.require_auth();
+
+        let is_patient = caller == patient;
+        let is_admin = rbac::has_permission(&env, &caller, &Permission::SystemAdmin);
+        if !is_patient && !is_admin {
+            return Err(ContractError::Unauthorized);
+        }
+
+        let list_key = (symbol_short!("ACC_LST"), patient.clone());
+        let grantees: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or(Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut remaining = Vec::new(&env);
+        let mut purged: u32 = 0;
+
+        for i in 0..grantees.len() {
+            if let Some(grantee) = grantees.get(i) {
+                let access_key = (symbol_short!("ACCESS"), patient.clone(), grantee.clone());
+
+                match env.storage().persistent().get::<_, AccessGrant>(&access_key) {
+                    Some(grant) if grant.expires_at <= now => {
+                        env.storage().persistent().remove(&access_key);
+                        events::publish_access_expired(
+                            &env,
+                            patient.clone(),
+                            grantee,
+                            grant.expires_at,
+                        );
+                        purged += 1;
+                    }
+                    Some(_) => {
+                        // Grant still active — keep in the list.
+                        remaining.push_back(grantee);
+                    }
+                    None => {
+                        // Already removed — nothing to purge, drop from list.
+                    }
+                }
+            }
+        }
+
+        // Update the grantee list to only keep active entries.
+        if remaining.is_empty() {
+            env.storage().persistent().remove(&list_key);
+        } else {
+            env.storage().persistent().set(&list_key, &remaining);
+        }
+
+        Ok(purged)
+    }
+
     /// Get the total number of records
     pub fn get_record_count(env: Env) -> u64 {
         let counter_key = symbol_short!("REC_CTR");
@@ -718,7 +1002,189 @@ impl VisionRecordsContract {
 
     /// Contract version
     pub fn version() -> u32 {
-        1
+        2  // Updated for patient profile management
+    }
+
+    // ======================== Patient Profile Management ========================
+
+    /// Create a new patient profile
+    pub fn create_profile(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        date_of_birth_hash: String,
+        gender_hash: String,
+        blood_type_hash: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only patient or authorized user can create profile
+        if caller != patient && !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        // Check if profile already exists
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        if env.storage().persistent().has(&profile_key) {
+            return Err(ContractError::InvalidInput); // Profile already exists
+        }
+        
+        let profile = PatientProfile {
+            patient: patient.clone(),
+            created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
+            is_active: true,
+            date_of_birth_hash,
+            gender_hash,
+            blood_type_hash,
+            emergency_contact: None,
+            insurance_info: None,
+            medical_history_refs: Vec::new(&env),
+        };
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_created(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Update patient demographics
+    pub fn update_demographics(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        date_of_birth_hash: String,
+        gender_hash: String,
+        blood_type_hash: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only profile owner can update
+        if caller != patient {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        let mut profile: PatientProfile = env
+            .storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)?;
+        
+        profile.date_of_birth_hash = date_of_birth_hash;
+        profile.gender_hash = gender_hash;
+        profile.blood_type_hash = blood_type_hash;
+        profile.updated_at = env.ledger().timestamp();
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_updated(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Update emergency contact information
+    pub fn update_emergency_contact(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        contact: Option<EmergencyContact>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only profile owner can update
+        if caller != patient {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        let mut profile: PatientProfile = env
+            .storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)?;
+        
+        profile.emergency_contact = contact;
+        profile.updated_at = env.ledger().timestamp();
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_updated(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Update insurance information (hashed values only)
+    pub fn update_insurance(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        insurance_info: Option<InsuranceInfo>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only profile owner can update
+        if caller != patient {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        let mut profile: PatientProfile = env
+            .storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)?;
+        
+        profile.insurance_info = insurance_info;
+        profile.updated_at = env.ledger().timestamp();
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_updated(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Add medical history reference (IPFS hash or record ID)
+    pub fn add_medical_history_reference(
+        env: Env,
+        caller: Address,
+        patient: Address,
+        reference: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        
+        // Only profile owner can update
+        if caller != patient {
+            return Err(ContractError::Unauthorized);
+        }
+        
+        let profile_key = (symbol_short!("PAT_PROF"), patient.clone());
+        let mut profile: PatientProfile = env
+            .storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)?;
+        
+        profile.medical_history_refs.push_back(reference);
+        profile.updated_at = env.ledger().timestamp();
+        
+        env.storage().persistent().set(&profile_key, &profile);
+        events::publish_profile_updated(&env, patient);
+        
+        Ok(())
+    }
+
+    /// Get patient profile
+    pub fn get_profile(env: Env, patient: Address) -> Result<PatientProfile, ContractError> {
+        let profile_key = (symbol_short!("PAT_PROF"), patient);
+        env.storage()
+            .persistent()
+            .get(&profile_key)
+            .ok_or(ContractError::UserNotFound)
+    }
+
+    /// Check if patient profile exists
+    pub fn profile_exists(env: Env, patient: Address) -> bool {
+        let profile_key = (symbol_short!("PAT_PROF"), patient);
+        env.storage().persistent().has(&profile_key)
     }
 
     // ======================== RBAC Endpoints ========================
@@ -732,6 +1198,7 @@ impl VisionRecordsContract {
         permission: Permission,
     ) -> Result<(), ContractError> {
         caller.require_auth();
+        // Unified check: covers direct role, custom grants, and delegated roles
         if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
             return Err(ContractError::Unauthorized);
         }
@@ -749,6 +1216,7 @@ impl VisionRecordsContract {
         permission: Permission,
     ) -> Result<(), ContractError> {
         caller.require_auth();
+        // Unified check: covers direct role, custom grants, and delegated roles
         if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
             return Err(ContractError::Unauthorized);
         }
@@ -777,1627 +1245,16 @@ impl VisionRecordsContract {
         rbac::has_permission(&env, &user, &permission)
     }
 
-    /// Registers a new healthcare provider in the system.
-    /// Requires the caller to have ManageUsers permission.
-    /// Returns the provider ID assigned to the new provider.
-    #[allow(clippy::too_many_arguments)]
-    pub fn register_provider(
-        env: Env,
-        caller: Address,
-        provider: Address,
-        name: String,
-        licenses: Vec<License>,
-        specialties: Vec<String>,
-        certifications: Vec<Certification>,
-        locations: Vec<Location>,
-    ) -> Result<u64, ContractError> {
-        caller.require_auth();
-
-        if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
-            return Err(ContractError::Unauthorized);
-        }
-
-        if provider::get_provider(&env, &provider).is_some() {
-            let resource_id = String::from_str(&env, "register_provider");
-            let context = create_error_context(
-                &env,
-                ContractError::ProviderAlreadyRegistered,
-                Some(caller.clone()),
-                Some(resource_id.clone()),
-            );
-            log_error(
-                &env,
-                ContractError::ProviderAlreadyRegistered,
-                Some(caller),
-                Some(resource_id),
-                None,
-            );
-            events::publish_error(
-                &env,
-                ContractError::ProviderAlreadyRegistered as u32,
-                context,
-            );
-            return Err(ContractError::ProviderAlreadyRegistered);
-        }
-
-        let provider_id = provider::increment_provider_counter(&env);
-        provider::add_provider_id(&env, provider_id, &provider);
-
-        let provider_data = Provider {
-            address: provider.clone(),
-            name: name.clone(),
-            licenses: licenses.clone(),
-            specialties: specialties.clone(),
-            certifications: certifications.clone(),
-            locations: locations.clone(),
-            verification_status: VerificationStatus::Pending,
-            registered_at: env.ledger().timestamp(),
-            verified_at: None,
-            verified_by: None,
-            is_active: true,
-        };
-
-        provider::set_provider(&env, &provider_data);
-
-        for specialty in specialties.iter() {
-            provider::add_provider_to_specialty_index(&env, &specialty, &provider);
-        }
-
-        events::publish_provider_registered(&env, provider.clone(), name, provider_id);
-
-        Ok(provider_id)
-    }
-
-    /// Verifies or updates the verification status of a provider.
-    /// Requires the caller to have ManageUsers permission.
-    /// Cannot set status to Pending.
-    pub fn verify_provider(
-        env: Env,
-        caller: Address,
-        provider: Address,
-        status: VerificationStatus,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
-            return Err(ContractError::Unauthorized);
-        }
-
-        let mut provider_data = match provider::get_provider(&env, &provider) {
-            Some(data) => data,
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::ProviderNotFound,
-                    Some(caller.clone()),
-                    Some(String::from_str(&env, "verify_provider")),
-                );
-                log_error(
-                    &env,
-                    ContractError::ProviderNotFound,
-                    Some(caller),
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::ProviderNotFound as u32, context);
-                return Err(ContractError::ProviderNotFound);
-            }
-        };
-
-        if status == VerificationStatus::Pending {
-            let context = create_error_context(
-                &env,
-                ContractError::InvalidVerificationStatus,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "verify_provider")),
-            );
-            log_error(
-                &env,
-                ContractError::InvalidVerificationStatus,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(
-                &env,
-                ContractError::InvalidVerificationStatus as u32,
-                context,
-            );
-            return Err(ContractError::InvalidVerificationStatus);
-        }
-
-        provider_data.verification_status = status.clone();
-        provider_data.verified_at = Some(env.ledger().timestamp());
-        provider_data.verified_by = Some(caller.clone());
-
-        // Status index is updated automatically in set_provider
-        provider::set_provider(&env, &provider_data);
-
-        // Grant rate limit bypass for verified providers
-        if status == VerificationStatus::Verified {
-            rate_limit::set_rate_limit_bypass(&env, &provider, true);
-            events::publish_rate_limit_bypass_updated(&env, provider.clone(), true, caller.clone());
-        } else {
-            // Remove bypass if status changes from Verified to something else
-            rate_limit::set_rate_limit_bypass(&env, &provider, false);
-            events::publish_rate_limit_bypass_updated(
-                &env,
-                provider.clone(),
-                false,
-                caller.clone(),
-            );
-        }
-
-        events::publish_provider_verified(&env, provider, caller, status);
-
-        Ok(())
-    }
-
-    /// Updates provider information including name, licenses, specialties, certifications, and locations.
-    /// The provider can update their own information, or users with ManageUsers permission can update any provider.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_provider(
-        env: Env,
-        caller: Address,
-        provider: Address,
-        name: Option<String>,
-        licenses: Option<Vec<License>>,
-        specialties: Option<Vec<String>>,
-        certifications: Option<Vec<Certification>>,
-        locations: Option<Vec<Location>>,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        if caller != provider && !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "update_provider")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        let mut provider_data = match provider::get_provider(&env, &provider) {
-            Some(data) => data,
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::ProviderNotFound,
-                    Some(caller.clone()),
-                    Some(String::from_str(&env, "update_provider")),
-                );
-                log_error(
-                    &env,
-                    ContractError::ProviderNotFound,
-                    Some(caller),
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::ProviderNotFound as u32, context);
-                return Err(ContractError::ProviderNotFound);
-            }
-        };
-
-        if let Some(new_name) = name {
-            provider_data.name = new_name;
-        }
-
-        if let Some(new_licenses) = licenses {
-            provider_data.licenses = new_licenses;
-        }
-
-        if let Some(new_specialties) = specialties {
-            for old_specialty in provider_data.specialties.iter() {
-                provider::remove_provider_from_specialty_index(&env, &old_specialty, &provider);
-            }
-            provider_data.specialties = new_specialties.clone();
-            for specialty in new_specialties.iter() {
-                provider::add_provider_to_specialty_index(&env, &specialty, &provider);
-            }
-        }
-
-        if let Some(new_certifications) = certifications {
-            provider_data.certifications = new_certifications;
-        }
-
-        if let Some(new_locations) = locations {
-            provider_data.locations = new_locations;
-        }
-
-        provider::set_provider(&env, &provider_data);
-
-        events::publish_provider_updated(&env, provider);
-
-        Ok(())
-    }
-
-    /// Retrieves provider information by address.
-    /// Returns the provider data if found, or an error if the provider is not registered.
-    pub fn get_provider(env: Env, provider: Address) -> Result<Provider, ContractError> {
-        match provider::get_provider(&env, &provider) {
-            Some(provider_data) => Ok(provider_data),
-            None => {
-                let resource_id = String::from_str(&env, "get_provider");
-                let context = create_error_context(
-                    &env,
-                    ContractError::ProviderNotFound,
-                    Some(provider.clone()),
-                    Some(resource_id.clone()),
-                );
-                log_error(
-                    &env,
-                    ContractError::ProviderNotFound,
-                    Some(provider),
-                    Some(resource_id),
-                    None,
-                );
-                events::publish_error(&env, ContractError::ProviderNotFound as u32, context);
-                Err(ContractError::ProviderNotFound)
-            }
-        }
-    }
-
-    /// Searches for providers by specialty.
-    /// Returns a vector of provider addresses matching the specified specialty.
-    pub fn search_providers_by_specialty(env: Env, specialty: String) -> Vec<Address> {
-        provider::get_providers_by_specialty(&env, &specialty)
-    }
-
-    /// Searches for providers by verification status.
-    /// Returns a vector of active provider addresses with the specified verification status.
-    /// Uses an efficient status index to avoid exceeding Soroban's 100-key limit.
-    pub fn search_providers_by_status(env: Env, status: VerificationStatus) -> Vec<Address> {
-        provider::get_providers_by_status(&env, &status)
-    }
-
-    /// Returns the total number of registered providers in the system.
-    pub fn get_provider_count(env: Env) -> u64 {
-        provider::get_provider_counter(&env)
-    }
-
-    /// Retrieves a provider address by provider ID.
-    /// Returns None if the provider ID does not exist.
-    #[allow(dead_code)]
-    fn get_provider_address_by_id(env: &Env, provider_id: u64) -> Option<Address> {
-        let id_key = (symbol_short!("PROV_ID"), provider_id);
-        env.storage().persistent().get(&id_key)
-    }
-
-    /// Retrieves the complete error log containing all logged errors.
-    /// The log is limited to the most recent 100 entries.
-    pub fn get_error_log(env: Env) -> Vec<ErrorLogEntry> {
-        errors::get_error_log(&env)
-    }
-
-    /// Returns the total count of errors that have been logged since contract initialization.
-    pub fn get_error_count(env: Env) -> u64 {
-        errors::get_error_count(&env)
-    }
-
-    /// Clears the error log and resets the error count.
-    /// Requires the caller to have SystemAdmin permission.
-    pub fn clear_error_log(env: Env, caller: Address) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
-            let resource_id = String::from_str(&env, "clear_error_log");
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(resource_id.clone()),
-            );
-            log_error(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller),
-                Some(resource_id),
-                None,
-            );
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        errors::clear_error_log(&env);
-        Ok(())
-    }
-
-    /// Checks if an operation can be retried based on the current retry count.
-    /// Returns true if the operation can be retried, false if max retries have been reached.
-    /// Max retries must be between 1 and 10.
-    pub fn retry_operation(
-        env: Env,
-        caller: Address,
-        operation: String,
-        max_retries: u32,
-    ) -> Result<bool, ContractError> {
-        caller.require_auth();
-
-        if max_retries == 0 || max_retries > 10 {
-            let resource_id = String::from_str(&env, "retry_operation");
-            let context = create_error_context(
-                &env,
-                ContractError::InvalidInput,
-                Some(caller.clone()),
-                Some(resource_id.clone()),
-            );
-            log_error(
-                &env,
-                ContractError::InvalidInput,
-                Some(caller),
-                Some(resource_id),
-                None,
-            );
-            events::publish_error(&env, ContractError::InvalidInput as u32, context);
-            return Err(ContractError::InvalidInput);
-        }
-
-        let retry_key = (symbol_short!("RETRY"), caller.clone(), operation.clone());
-        let retry_count: u32 = env.storage().persistent().get(&retry_key).unwrap_or(0);
-
-        if retry_count >= max_retries {
-            env.storage().persistent().remove(&retry_key);
-            Ok(false)
-        } else {
-            env.storage()
-                .persistent()
-                .set(&retry_key, &(retry_count + 1));
-            Ok(true)
-        }
-    }
-
-    /// Resets the retry count for a specific operation and caller.
-    /// This allows the operation to be retried from the beginning.
-    pub fn reset_retry_count(
-        env: Env,
-        caller: Address,
-        operation: String,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let retry_key = (symbol_short!("RETRY"), caller, operation);
-        env.storage().persistent().remove(&retry_key);
-        Ok(())
-    }
-
-    // ======================== Emergency Access Endpoints ========================
-
-    /// Grants emergency access to a patient's records for critical care situations.
-    /// Requires the requester to be a verified provider with appropriate permissions.
-    /// Emergency access is always time-limited and requires attestation.
-    #[allow(clippy::arithmetic_side_effects)]
-    pub fn grant_emergency_access(
-        env: Env,
-        caller: Address,
-        patient: Address,
-        condition: EmergencyCondition,
-        attestation: String,
-        duration_seconds: u64,
-        emergency_contacts: Vec<Address>,
-    ) -> Result<u64, ContractError> {
-        caller.require_auth();
-
-        // Validate attestation is not empty
-        if attestation.is_empty() {
-            let context = create_error_context(
-                &env,
-                ContractError::InvalidAttestation,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "grant_emergency_access")),
-            );
-            log_error(
-                &env,
-                ContractError::InvalidAttestation,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(&env, ContractError::InvalidAttestation as u32, context);
-            return Err(ContractError::InvalidAttestation);
-        }
-
-        // Validate duration (max 24 hours for emergency access)
-        const MAX_EMERGENCY_DURATION: u64 = 86400; // 24 hours in seconds
-        if duration_seconds == 0 || duration_seconds > MAX_EMERGENCY_DURATION {
-            let context = create_error_context(
-                &env,
-                ContractError::InvalidInput,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "grant_emergency_access")),
-            );
-            log_error(&env, ContractError::InvalidInput, Some(caller), None, None);
-            events::publish_error(&env, ContractError::InvalidInput as u32, context);
-            return Err(ContractError::InvalidInput);
-        }
-
-        // Requester must be a verified provider or have SystemAdmin permission
-        let is_provider = provider::get_provider(&env, &caller)
-            .map(|p| p.verification_status == VerificationStatus::Verified)
-            .unwrap_or(false);
-
-        if !is_provider && !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "grant_emergency_access")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        let access_id = emergency::increment_emergency_counter(&env);
-        let granted_at = env.ledger().timestamp();
-        let expires_at = granted_at + duration_seconds;
-
-        let emergency_access = EmergencyAccess {
-            id: access_id,
-            patient: patient.clone(),
-            requester: caller.clone(),
-            condition: condition.clone(),
-            attestation: attestation.clone(),
-            granted_at,
-            expires_at,
-            status: EmergencyStatus::Active,
-            notified_contacts: emergency_contacts.clone(),
-        };
-
-        emergency::set_emergency_access(&env, &emergency_access);
-
-        // Create audit entry
-        let audit_entry = EmergencyAuditEntry {
-            access_id,
-            actor: caller.clone(),
-            action: String::from_str(&env, "GRANTED"),
-            timestamp: granted_at,
-        };
-        emergency::add_audit_entry(&env, &audit_entry);
-
-        // Publish events
-        events::publish_emergency_access_granted(
-            &env,
-            access_id,
-            patient.clone(),
-            caller.clone(),
-            condition,
-            expires_at,
-        );
-
-        // Notify emergency contacts
-        for contact in emergency_contacts.iter() {
-            events::publish_emergency_contact_notified(
-                &env,
-                access_id,
-                patient.clone(),
-                contact.clone(),
-            );
-        }
-
-        Ok(access_id)
-    }
-
-    /// Revokes an active emergency access grant.
-    /// Can be called by the patient, the original requester, or a SystemAdmin.
-    pub fn revoke_emergency_access(
-        env: Env,
-        caller: Address,
-        access_id: u64,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        let emergency_access = match emergency::get_emergency_access(&env, access_id) {
-            Some(access) => access,
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::EmergencyAccessNotFound,
-                    Some(caller.clone()),
-                    Some(String::from_str(&env, "revoke_emergency_access")),
-                );
-                log_error(
-                    &env,
-                    ContractError::EmergencyAccessNotFound,
-                    Some(caller),
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::EmergencyAccessNotFound as u32, context);
-                return Err(ContractError::EmergencyAccessNotFound);
-            }
-        };
-
-        // Check authorization: patient, original requester, or SystemAdmin
-        let is_authorized = caller == emergency_access.patient
-            || caller == emergency_access.requester
-            || rbac::has_permission(&env, &caller, &Permission::SystemAdmin);
-
-        if !is_authorized {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "revoke_emergency_access")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        if emergency_access.status != EmergencyStatus::Active {
-            let error = if emergency_access.status == EmergencyStatus::Expired {
-                ContractError::EmergencyAccessExpired
-            } else {
-                ContractError::EmergencyAccessRevoked
-            };
-            let context = create_error_context(
-                &env,
-                error,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "revoke_emergency_access")),
-            );
-            log_error(&env, error, Some(caller), None, None);
-            events::publish_error(&env, error as u32, context);
-            return Err(error);
-        }
-
-        emergency::revoke_emergency_access(&env, access_id);
-
-        // Create audit entry
-        let audit_entry = EmergencyAuditEntry {
-            access_id,
-            actor: caller.clone(),
-            action: String::from_str(&env, "REVOKED"),
-            timestamp: env.ledger().timestamp(),
-        };
-        emergency::add_audit_entry(&env, &audit_entry);
-
-        // Publish event
-        events::publish_emergency_access_revoked(&env, access_id, emergency_access.patient, caller);
-
-        Ok(())
-    }
-
-    /// Checks if emergency access is currently active for a patient-requester pair.
-    /// Returns the emergency access if active, None otherwise.
-    pub fn check_emergency_access(
-        env: Env,
-        patient: Address,
-        requester: Address,
-    ) -> Option<EmergencyAccess> {
-        emergency::has_active_emergency_access(&env, &patient, &requester)
-    }
-
-    /// Uses emergency access to read a patient's record.
-    /// Creates an audit trail and publishes an event.
-    pub fn access_record_via_emergency(
-        env: Env,
-        caller: Address,
-        patient: Address,
-        record_id: Option<u64>,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        let emergency_access = match emergency::has_active_emergency_access(&env, &patient, &caller)
-        {
-            Some(access) => access,
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::EmergencyAccessDenied,
-                    Some(caller.clone()),
-                    Some(String::from_str(&env, "access_record_via_emergency")),
-                );
-                log_error(
-                    &env,
-                    ContractError::EmergencyAccessDenied,
-                    Some(caller),
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::EmergencyAccessDenied as u32, context);
-                return Err(ContractError::EmergencyAccessDenied);
-            }
-        };
-
-        // Verify access hasn't expired
-        if emergency_access.expires_at <= env.ledger().timestamp() {
-            // Log failed emergency access attempt
-            let audit_entry = audit::create_audit_entry(
-                &env,
-                caller.clone(),
-                patient.clone(),
-                record_id,
-                AccessAction::EmergencyAccess,
-                AccessResult::Expired,
-                Some(String::from_str(&env, "Emergency access expired")),
-            );
-            audit::add_audit_entry(&env, &audit_entry);
-            events::publish_audit_log_entry(&env, &audit_entry);
-
-            let context = create_error_context(
-                &env,
-                ContractError::EmergencyAccessExpired,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "access_record_via_emergency")),
-            );
-            log_error(
-                &env,
-                ContractError::EmergencyAccessExpired,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(&env, ContractError::EmergencyAccessExpired as u32, context);
-            return Err(ContractError::EmergencyAccessExpired);
-        }
-
-        // Create emergency audit entry
-        let emergency_audit_entry = EmergencyAuditEntry {
-            access_id: emergency_access.id,
-            actor: caller.clone(),
-            action: String::from_str(&env, "ACCESSED"),
-            timestamp: env.ledger().timestamp(),
-        };
-        emergency::add_audit_entry(&env, &emergency_audit_entry);
-
-        // Create general audit entry
-        let audit_entry = audit::create_audit_entry(
-            &env,
-            caller.clone(),
-            patient.clone(),
-            record_id,
-            AccessAction::EmergencyAccess,
-            AccessResult::Success,
-            None,
-        );
-        audit::add_audit_entry(&env, &audit_entry);
-        events::publish_audit_log_entry(&env, &audit_entry);
-
-        // Publish event
-        events::publish_emergency_access_used(
-            &env,
-            emergency_access.id,
-            patient,
-            caller,
-            record_id,
-        );
-
-        Ok(())
-    }
-
-    /// Retrieves emergency access information by ID.
-    pub fn get_emergency_access(
-        env: Env,
-        access_id: u64,
-    ) -> Result<EmergencyAccess, ContractError> {
-        match emergency::get_emergency_access(&env, access_id) {
-            Some(access) => Ok(access),
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::EmergencyAccessNotFound,
-                    None,
-                    Some(String::from_str(&env, "get_emergency_access")),
-                );
-                log_error(
-                    &env,
-                    ContractError::EmergencyAccessNotFound,
-                    None,
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::EmergencyAccessNotFound as u32, context);
-                Err(ContractError::EmergencyAccessNotFound)
-            }
-        }
-    }
-
-    /// Retrieves all active emergency accesses for a patient.
-    pub fn get_patient_emergency_accesses(env: Env, patient: Address) -> Vec<EmergencyAccess> {
-        emergency::get_patient_emergency_accesses(&env, &patient)
-    }
-
-    /// Retrieves audit trail for an emergency access ID.
-    pub fn get_emergency_audit_trail(
-        env: Env,
-        access_id: u64,
-    ) -> Result<Vec<EmergencyAuditEntry>, ContractError> {
-        match emergency::get_emergency_access(&env, access_id) {
-            Some(_) => Ok(emergency::get_audit_entries(&env, access_id)),
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::EmergencyAccessNotFound,
-                    None,
-                    Some(String::from_str(&env, "get_emergency_audit_trail")),
-                );
-                log_error(
-                    &env,
-                    ContractError::EmergencyAccessNotFound,
-                    None,
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::EmergencyAccessNotFound as u32, context);
-                Err(ContractError::EmergencyAccessNotFound)
-            }
-        }
-    }
-
-    /// Expires emergency accesses that have passed their expiration time.
-    /// Returns the number of accesses expired.
-    pub fn expire_emergency_accesses(env: Env) -> u32 {
-        emergency::expire_emergency_accesses(&env)
-    }
-
-    // ======================== Appointment Scheduling Endpoints ========================
-
-    /// Schedules a new appointment between a patient and provider.
-    /// Requires the caller to be the patient, provider, or have ManageUsers permission.
-    #[allow(clippy::too_many_arguments)]
-    pub fn schedule_appointment(
-        env: Env,
-        caller: Address,
-        patient: Address,
-        provider: Address,
-        appointment_type: AppointmentType,
-        scheduled_at: u64,
-        duration_minutes: u32,
-        notes: Option<String>,
-    ) -> Result<u64, ContractError> {
-        caller.require_auth();
-
-        // Validate authorization: patient, provider, or admin
-        let is_authorized = caller == patient
-            || caller == provider
-            || rbac::has_permission(&env, &caller, &Permission::ManageUsers);
-
-        if !is_authorized {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "schedule_appointment")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        // Validate scheduled time is in the future
-        let current_time = env.ledger().timestamp();
-        if scheduled_at <= current_time {
-            let context = create_error_context(
-                &env,
-                ContractError::InvalidAppointmentTime,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "schedule_appointment")),
-            );
-            log_error(
-                &env,
-                ContractError::InvalidAppointmentTime,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(&env, ContractError::InvalidAppointmentTime as u32, context);
-            return Err(ContractError::InvalidAppointmentTime);
-        }
-
-        // Validate duration (1 minute to 8 hours)
-        if duration_minutes == 0 || duration_minutes > 480 {
-            let context = create_error_context(
-                &env,
-                ContractError::InvalidInput,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "schedule_appointment")),
-            );
-            log_error(&env, ContractError::InvalidInput, Some(caller), None, None);
-            events::publish_error(&env, ContractError::InvalidInput as u32, context);
-            return Err(ContractError::InvalidInput);
-        }
-
-        let appointment_id = appointment::increment_appointment_counter(&env);
-        let created_at = current_time;
-
-        let appointment = Appointment {
-            id: appointment_id,
-            patient: patient.clone(),
-            provider: provider.clone(),
-            appointment_type: appointment_type.clone(),
-            scheduled_at,
-            duration_minutes,
-            status: AppointmentStatus::Scheduled,
-            notes,
-            created_at,
-            updated_at: created_at,
-            verified_at: None,
-            verified_by: None,
-            reminder_sent: false,
-        };
-
-        appointment::set_appointment(&env, &appointment);
-
-        // Create history entry
-        let history_entry = AppointmentHistoryEntry {
-            appointment_id,
-            action: String::from_str(&env, "CREATED"),
-            actor: caller.clone(),
-            timestamp: created_at,
-            previous_status: AppointmentStatus::None,
-            new_status: AppointmentStatus::Scheduled,
-            notes: None,
-        };
-        appointment::add_history_entry(&env, &history_entry);
-
-        // Publish event
-        events::publish_appointment_scheduled(
-            &env,
-            appointment_id,
-            patient,
-            provider,
-            appointment_type,
-            scheduled_at,
-        );
-
-        Ok(appointment_id)
-    }
-
-    /// Confirms an appointment.
-    /// Can be called by patient, provider, or admin.
-    pub fn confirm_appointment(
-        env: Env,
-        caller: Address,
-        appointment_id: u64,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        let mut appointment = match appointment::get_appointment(&env, appointment_id) {
-            Some(apt) => apt,
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller.clone()),
-                    Some(String::from_str(&env, "confirm_appointment")),
-                );
-                log_error(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller),
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::AppointmentNotFound as u32, context);
-                return Err(ContractError::AppointmentNotFound);
-            }
-        };
-
-        // Validate authorization
-        let is_authorized = caller == appointment.patient
-            || caller == appointment.provider
-            || rbac::has_permission(&env, &caller, &Permission::ManageUsers);
-
-        if !is_authorized {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "confirm_appointment")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        // Validate status can be changed to Confirmed
-        if appointment.status != AppointmentStatus::Scheduled {
-            let context = create_error_context(
-                &env,
-                ContractError::AppointmentCannotBeModified,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "confirm_appointment")),
-            );
-            log_error(
-                &env,
-                ContractError::AppointmentCannotBeModified,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(
-                &env,
-                ContractError::AppointmentCannotBeModified as u32,
-                context,
-            );
-            return Err(ContractError::AppointmentCannotBeModified);
-        }
-
-        let previous_status = appointment.status.clone();
-        appointment.status = AppointmentStatus::Confirmed;
-        appointment.updated_at = env.ledger().timestamp();
-        appointment::set_appointment(&env, &appointment);
-
-        // Create history entry
-        let history_entry = AppointmentHistoryEntry {
-            appointment_id,
-            action: String::from_str(&env, "CONFIRMED"),
-            actor: caller.clone(),
-            timestamp: env.ledger().timestamp(),
-            previous_status,
-            new_status: AppointmentStatus::Confirmed,
-            notes: None,
-        };
-        appointment::add_history_entry(&env, &history_entry);
-
-        // Publish event
-        events::publish_appointment_confirmed(
-            &env,
-            appointment_id,
-            appointment.patient,
-            appointment.provider,
-            caller,
-        );
-
-        Ok(())
-    }
-
-    /// Cancels an appointment.
-    /// Can be called by patient, provider, or admin.
-    pub fn cancel_appointment(
-        env: Env,
-        caller: Address,
-        appointment_id: u64,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        let mut appointment = match appointment::get_appointment(&env, appointment_id) {
-            Some(apt) => apt,
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller.clone()),
-                    Some(String::from_str(&env, "cancel_appointment")),
-                );
-                log_error(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller),
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::AppointmentNotFound as u32, context);
-                return Err(ContractError::AppointmentNotFound);
-            }
-        };
-
-        // Validate authorization
-        let is_authorized = caller == appointment.patient
-            || caller == appointment.provider
-            || rbac::has_permission(&env, &caller, &Permission::ManageUsers);
-
-        if !is_authorized {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "cancel_appointment")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        // Validate status can be cancelled
-        if appointment.status == AppointmentStatus::Cancelled
-            || appointment.status == AppointmentStatus::Completed
-        {
-            let context = create_error_context(
-                &env,
-                ContractError::AppointmentCannotBeModified,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "cancel_appointment")),
-            );
-            log_error(
-                &env,
-                ContractError::AppointmentCannotBeModified,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(
-                &env,
-                ContractError::AppointmentCannotBeModified as u32,
-                context,
-            );
-            return Err(ContractError::AppointmentCannotBeModified);
-        }
-
-        let previous_status = appointment.status.clone();
-        appointment.status = AppointmentStatus::Cancelled;
-        appointment.updated_at = env.ledger().timestamp();
-        appointment::set_appointment(&env, &appointment);
-
-        // Create history entry
-        let history_entry = AppointmentHistoryEntry {
-            appointment_id,
-            action: String::from_str(&env, "CANCELLED"),
-            actor: caller.clone(),
-            timestamp: env.ledger().timestamp(),
-            previous_status,
-            new_status: AppointmentStatus::Cancelled,
-            notes: None,
-        };
-        appointment::add_history_entry(&env, &history_entry);
-
-        // Publish event
-        events::publish_appointment_cancelled(
-            &env,
-            appointment_id,
-            appointment.patient,
-            appointment.provider,
-            caller,
-        );
-
-        Ok(())
-    }
-
-    /// Reschedules an appointment to a new time.
-    /// Can be called by patient, provider, or admin.
-    pub fn reschedule_appointment(
-        env: Env,
-        caller: Address,
-        appointment_id: u64,
-        new_scheduled_at: u64,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        let mut appointment = match appointment::get_appointment(&env, appointment_id) {
-            Some(apt) => apt,
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller.clone()),
-                    Some(String::from_str(&env, "reschedule_appointment")),
-                );
-                log_error(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller),
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::AppointmentNotFound as u32, context);
-                return Err(ContractError::AppointmentNotFound);
-            }
-        };
-
-        // Validate authorization
-        let is_authorized = caller == appointment.patient
-            || caller == appointment.provider
-            || rbac::has_permission(&env, &caller, &Permission::ManageUsers);
-
-        if !is_authorized {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "reschedule_appointment")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        // Validate new time is in the future
-        let current_time = env.ledger().timestamp();
-        if new_scheduled_at <= current_time {
-            let context = create_error_context(
-                &env,
-                ContractError::InvalidAppointmentTime,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "reschedule_appointment")),
-            );
-            log_error(
-                &env,
-                ContractError::InvalidAppointmentTime,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(&env, ContractError::InvalidAppointmentTime as u32, context);
-            return Err(ContractError::InvalidAppointmentTime);
-        }
-
-        // Validate status can be rescheduled
-        if appointment.status == AppointmentStatus::Cancelled
-            || appointment.status == AppointmentStatus::Completed
-        {
-            let context = create_error_context(
-                &env,
-                ContractError::AppointmentCannotBeModified,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "reschedule_appointment")),
-            );
-            log_error(
-                &env,
-                ContractError::AppointmentCannotBeModified,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(
-                &env,
-                ContractError::AppointmentCannotBeModified as u32,
-                context,
-            );
-            return Err(ContractError::AppointmentCannotBeModified);
-        }
-
-        let old_scheduled_at = appointment.scheduled_at;
-        appointment.scheduled_at = new_scheduled_at;
-        appointment.status = AppointmentStatus::Rescheduled;
-        appointment.updated_at = env.ledger().timestamp();
-        appointment.reminder_sent = false; // Reset reminder flag
-        appointment::set_appointment(&env, &appointment);
-
-        // Create history entry
-        let history_entry = AppointmentHistoryEntry {
-            appointment_id,
-            action: String::from_str(&env, "RESCHEDULED"),
-            actor: caller.clone(),
-            timestamp: env.ledger().timestamp(),
-            previous_status: AppointmentStatus::None,
-            new_status: AppointmentStatus::Rescheduled,
-            notes: None,
-        };
-        appointment::add_history_entry(&env, &history_entry);
-
-        // Publish event
-        events::publish_appointment_rescheduled(
-            &env,
-            appointment_id,
-            appointment.patient,
-            appointment.provider,
-            old_scheduled_at,
-            new_scheduled_at,
-            caller,
-        );
-
-        Ok(())
-    }
-
-    /// Marks an appointment as completed.
-    /// Can be called by provider or admin.
-    pub fn complete_appointment(
-        env: Env,
-        caller: Address,
-        appointment_id: u64,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        let mut appointment = match appointment::get_appointment(&env, appointment_id) {
-            Some(apt) => apt,
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller.clone()),
-                    Some(String::from_str(&env, "complete_appointment")),
-                );
-                log_error(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller),
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::AppointmentNotFound as u32, context);
-                return Err(ContractError::AppointmentNotFound);
-            }
-        };
-
-        // Validate authorization: provider or admin
-        let is_authorized = caller == appointment.provider
-            || rbac::has_permission(&env, &caller, &Permission::ManageUsers);
-
-        if !is_authorized {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "complete_appointment")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        // Validate status can be completed
-        if appointment.status == AppointmentStatus::Cancelled
-            || appointment.status == AppointmentStatus::Completed
-        {
-            let context = create_error_context(
-                &env,
-                ContractError::AppointmentCannotBeModified,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "complete_appointment")),
-            );
-            log_error(
-                &env,
-                ContractError::AppointmentCannotBeModified,
-                Some(caller),
-                None,
-                None,
-            );
-            events::publish_error(
-                &env,
-                ContractError::AppointmentCannotBeModified as u32,
-                context,
-            );
-            return Err(ContractError::AppointmentCannotBeModified);
-        }
-
-        let previous_status = appointment.status.clone();
-        appointment.status = AppointmentStatus::Completed;
-        appointment.updated_at = env.ledger().timestamp();
-        appointment::set_appointment(&env, &appointment);
-
-        // Create history entry
-        let history_entry = AppointmentHistoryEntry {
-            appointment_id,
-            action: String::from_str(&env, "COMPLETED"),
-            actor: caller.clone(),
-            timestamp: env.ledger().timestamp(),
-            previous_status,
-            new_status: AppointmentStatus::Completed,
-            notes: None,
-        };
-        appointment::add_history_entry(&env, &history_entry);
-
-        // Publish event
-        events::publish_appointment_completed(
-            &env,
-            appointment_id,
-            appointment.patient,
-            appointment.provider,
-            caller,
-        );
-
-        Ok(())
-    }
-
-    /// Verifies an appointment.
-    /// Requires ManageUsers permission.
-    pub fn verify_appointment(
-        env: Env,
-        caller: Address,
-        appointment_id: u64,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        if !rbac::has_permission(&env, &caller, &Permission::ManageUsers) {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "verify_appointment")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        let mut appointment = match appointment::get_appointment(&env, appointment_id) {
-            Some(apt) => apt,
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller.clone()),
-                    Some(String::from_str(&env, "verify_appointment")),
-                );
-                log_error(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    Some(caller),
-                    None,
-                    None,
-                );
-                events::publish_error(&env, ContractError::AppointmentNotFound as u32, context);
-                return Err(ContractError::AppointmentNotFound);
-            }
-        };
-
-        appointment.verified_at = Some(env.ledger().timestamp());
-        appointment.verified_by = Some(caller.clone());
-        appointment.updated_at = env.ledger().timestamp();
-        appointment::set_appointment(&env, &appointment);
-
-        // Create history entry
-        let history_entry = AppointmentHistoryEntry {
-            appointment_id,
-            action: String::from_str(&env, "VERIFIED"),
-            actor: caller.clone(),
-            timestamp: env.ledger().timestamp(),
-            previous_status: AppointmentStatus::None,
-            new_status: AppointmentStatus::None,
-            notes: None,
-        };
-        appointment::add_history_entry(&env, &history_entry);
-
-        // Publish event
-        events::publish_appointment_verified(
-            &env,
-            appointment_id,
-            appointment.patient,
-            appointment.provider,
-            caller,
-        );
-
-        Ok(())
-    }
-
-    /// Sends reminders for appointments that need them.
-    /// Returns the number of reminders sent.
-    pub fn send_appointment_reminders(
-        env: Env,
-        reminder_window_seconds: u64,
-    ) -> Result<u32, ContractError> {
-        let appointments =
-            appointment::get_appointments_needing_reminders(&env, reminder_window_seconds);
-
-        let mut reminder_count = 0u32;
-
-        for i in 0..appointments.len() {
-            if let Some(apt) = appointments.get(i) {
-                // Mark reminder as sent
-                if appointment::mark_reminder_sent(&env, apt.id).is_some() {
-                    let patient = apt.patient.clone();
-                    let provider = apt.provider.clone();
-
-                    // Publish reminder event
-                    events::publish_appointment_reminder(
-                        &env,
-                        apt.id,
-                        patient.clone(),
-                        provider,
-                        apt.scheduled_at,
-                    );
-
-                    // Create history entry
-                    let history_entry = AppointmentHistoryEntry {
-                        appointment_id: apt.id,
-                        action: String::from_str(&env, "REMINDER_SENT"),
-                        actor: patient, // System action
-                        timestamp: env.ledger().timestamp(),
-                        previous_status: AppointmentStatus::None,
-                        new_status: AppointmentStatus::None,
-                        notes: None,
-                    };
-                    appointment::add_history_entry(&env, &history_entry);
-
-                    reminder_count += 1;
-                }
-            }
-        }
-
-        Ok(reminder_count)
-    }
-
-    /// Retrieves an appointment by ID.
-    pub fn get_appointment(env: Env, appointment_id: u64) -> Result<Appointment, ContractError> {
-        match appointment::get_appointment(&env, appointment_id) {
-            Some(apt) => Ok(apt),
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    None,
-                    Some(String::from_str(&env, "get_appointment")),
-                );
-                log_error(&env, ContractError::AppointmentNotFound, None, None, None);
-                events::publish_error(&env, ContractError::AppointmentNotFound as u32, context);
-                Err(ContractError::AppointmentNotFound)
-            }
-        }
-    }
-
-    /// Retrieves all appointments for a patient.
-    pub fn get_patient_appointments(env: Env, patient: Address) -> Vec<Appointment> {
-        appointment::get_patient_appointments(&env, &patient)
-    }
-
-    /// Retrieves all appointments for a provider.
-    pub fn get_provider_appointments(env: Env, provider: Address) -> Vec<Appointment> {
-        appointment::get_provider_appointments(&env, &provider)
-    }
-
-    /// Retrieves upcoming appointments for a patient.
-    pub fn get_patient_upcoming(env: Env, patient: Address) -> Vec<Appointment> {
-        appointment::get_upcoming_patient_appointments(&env, &patient)
-    }
-
-    /// Retrieves appointment history for an appointment ID.
-    pub fn get_appointment_history(
-        env: Env,
-        appointment_id: u64,
-    ) -> Result<Vec<AppointmentHistoryEntry>, ContractError> {
-        match appointment::get_appointment(&env, appointment_id) {
-            Some(_) => Ok(appointment::get_appointment_history(&env, appointment_id)),
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::AppointmentNotFound,
-                    None,
-                    Some(String::from_str(&env, "get_appointment_history")),
-                );
-                log_error(&env, ContractError::AppointmentNotFound, None, None, None);
-                events::publish_error(&env, ContractError::AppointmentNotFound as u32, context);
-                Err(ContractError::AppointmentNotFound)
-            }
-        }
-    }
-
-    // ======================== Audit Logging Endpoints ========================
-
-    /// Retrieves an audit entry by ID.
-    pub fn get_audit_entry(env: Env, entry_id: u64) -> Result<AuditEntry, ContractError> {
-        match audit::get_audit_entry(&env, entry_id) {
-            Some(entry) => Ok(entry),
-            None => {
-                let context = create_error_context(
-                    &env,
-                    ContractError::RecordNotFound, // Reuse RecordNotFound for audit entries
-                    None,
-                    Some(String::from_str(&env, "get_audit_entry")),
-                );
-                log_error(&env, ContractError::RecordNotFound, None, None, None);
-                events::publish_error(&env, ContractError::RecordNotFound as u32, context);
-                Err(ContractError::RecordNotFound)
-            }
-        }
-    }
-
-    /// Retrieves all audit entries for a specific record.
-    pub fn get_record_audit_log(env: Env, record_id: u64) -> Vec<AuditEntry> {
-        audit::get_record_audit_log(&env, record_id)
-    }
-
-    /// Retrieves all audit entries for a specific user (actor).
-    pub fn get_user_audit_log(env: Env, user: Address) -> Vec<AuditEntry> {
-        audit::get_user_audit_log(&env, &user)
-    }
-
-    /// Retrieves all audit entries for a specific patient.
-    pub fn get_patient_audit_log(env: Env, patient: Address) -> Vec<AuditEntry> {
-        audit::get_patient_audit_log(&env, &patient)
-    }
-
-    /// Retrieves audit entries filtered by action type.
-    pub fn get_audit_log_by_action(env: Env, action: AccessAction) -> Vec<AuditEntry> {
-        audit::get_audit_log_by_action(&env, action)
-    }
-
-    /// Retrieves audit entries filtered by result.
-    pub fn get_audit_log_by_result(env: Env, result: AccessResult) -> Vec<AuditEntry> {
-        audit::get_audit_log_by_result(&env, result)
-    }
-
-    /// Retrieves audit entries within a time range.
-    pub fn get_audit_log_by_time_range(
-        env: Env,
-        start_time: u64,
-        end_time: u64,
-    ) -> Vec<AuditEntry> {
-        audit::get_audit_log_by_time_range(&env, start_time, end_time)
-    }
-
-    /// Retrieves recent audit entries (last N entries).
-    pub fn get_recent_audit_log(env: Env, limit: u64) -> Vec<AuditEntry> {
-        audit::get_recent_audit_log(&env, limit)
-    }
-
-    // ── Rate Limiting Functions ────────────────────────────────────────────────
-
-    /// Sets rate limit configuration for an operation
-    pub fn set_rate_limit_config(
-        env: Env,
-        caller: Address,
-        operation: String,
-        max_requests: u32,
-        window_seconds: u64,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "set_rate_limit_config")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        let config = RateLimitConfig {
-            max_requests,
-            window_seconds,
-            operation: operation.clone(),
-        };
-        rate_limit::set_rate_limit_config(&env, &config);
-        events::publish_rate_limit_config_updated(
-            &env,
-            operation,
-            max_requests,
-            window_seconds,
-            caller,
-        );
-
-        Ok(())
-    }
-
-    /// Gets rate limit configuration for an operation
-    pub fn get_rate_limit_config(env: Env, operation: String) -> Option<RateLimitConfig> {
-        rate_limit::get_rate_limit_config(&env, &operation)
-    }
-
-    /// Gets rate limit status for an address and operation
-    pub fn get_rate_limit_status(
-        env: Env,
-        address: Address,
-        operation: String,
-    ) -> Option<RateLimitStatus> {
-        rate_limit::get_rate_limit_status(&env, &address, &operation)
-    }
-
-    /// Sets rate limit bypass for an address (admin only)
-    pub fn set_rate_limit_bypass(
-        env: Env,
-        caller: Address,
-        address: Address,
-        bypass: bool,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-
-        if !rbac::has_permission(&env, &caller, &Permission::SystemAdmin) {
-            let context = create_error_context(
-                &env,
-                ContractError::Unauthorized,
-                Some(caller.clone()),
-                Some(String::from_str(&env, "set_rate_limit_bypass")),
-            );
-            log_error(&env, ContractError::Unauthorized, Some(caller), None, None);
-            events::publish_error(&env, ContractError::Unauthorized as u32, context);
-            return Err(ContractError::Unauthorized);
-        }
-
-        rate_limit::set_rate_limit_bypass(&env, &address, bypass);
-        events::publish_rate_limit_bypass_updated(&env, address, bypass, caller);
-
-        Ok(())
-    }
-
-    /// Checks if an address has rate limit bypass
-    pub fn has_rate_limit_bypass(env: Env, address: Address) -> bool {
-        rate_limit::has_rate_limit_bypass(&env, &address)
-    }
-
-    /// Gets all rate limit configurations
-    pub fn get_all_rate_limit_configs(env: Env) -> Vec<RateLimitConfig> {
-        rate_limit::get_all_rate_limit_configs(&env)
-    }
-}
+#[cfg(test)]
+mod test;
 
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
+mod test_pause;
+#[cfg(test)]
 mod test_rbac;
+
+#[cfg(test)]
+mod test_batch;

@@ -55,8 +55,24 @@ pub struct AccessRevokedEvent {
     pub timestamp: u64,
 }
 
-/// Publishes an event when the contract is initialized.
-/// This event includes the admin address and initialization timestamp.
+/// Event published when a batch of records is added.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRecordsAddedEvent {
+    pub provider: Address,
+    pub count: u32,
+    pub timestamp: u64,
+}
+
+/// Event published when a batch of access grants is made.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchAccessGrantedEvent {
+    pub patient: Address,
+    pub count: u32,
+    pub timestamp: u64,
+}
+
 pub fn publish_initialized(env: &Env, admin: Address) {
     let topics = (symbol_short!("INIT"),);
     let data = InitializedEvent {
@@ -133,6 +149,21 @@ pub fn publish_access_revoked(env: &Env, patient: Address, grantee: Address) {
     env.events().publish(topics, data);
 }
 
+pub fn publish_access_expired(
+    env: &Env,
+    patient: Address,
+    grantee: Address,
+    expired_at: u64,
+) {
+    let topics = (symbol_short!("ACC_EXP"), patient.clone(), grantee.clone());
+    let data = AccessExpiredEvent {
+        patient,
+        grantee,
+        expired_at,
+        purged_at: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
 /// Event published when a new provider is registered.
 #[soroban_sdk::contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,6 +171,14 @@ pub struct ProviderRegisteredEvent {
     pub provider: Address,
     pub name: String,
     pub provider_id: u64,
+    pub timestamp: u64,
+}
+
+/// Event published when an eye examination is added to a record.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExaminationAddedEvent {
+    pub record_id: u64,
     pub timestamp: u64,
 }
 
@@ -189,19 +228,114 @@ pub fn publish_provider_verified(
     );
     let data = ProviderVerifiedEvent {
         provider,
-        verifier,
-        status,
+        count,
         timestamp: env.ledger().timestamp(),
     };
     env.events().publish(topics, data);
 }
 
-/// Publishes an event when provider information is updated.
-/// This event includes the provider address and update timestamp.
-pub fn publish_provider_updated(env: &Env, provider: Address) {
-    let topics = (symbol_short!("PROV_UPD"), provider.clone());
-    let data = ProviderUpdatedEvent {
-        provider,
+pub fn publish_batch_access_granted(env: &Env, patient: Address, count: u32) {
+    let topics = (symbol_short!("BATCH_A"), patient.clone());
+    let data = BatchAccessGrantedEvent {
+        patient,
+        count,
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
+
+/// Publishes an event when an examination is added.
+/// This event includes the record ID.
+pub fn publish_examination_added(env: &Env, record_id: u64) {
+    let topics = (symbol_short!("EXAM_ADD"), record_id);
+    let data = ExaminationAddedEvent {
+        record_id,
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
+
+/// Event published when access is granted via meta-transaction.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetaAccessGrantedEvent {
+    pub patient: Address,
+    pub grantee: Address,
+    pub level: AccessLevel,
+    pub relayer: Address,
+    pub expires_at: u64,
+    pub nonce: u64,
+    pub timestamp: u64,
+}
+
+/// Publishes an event when access is granted via meta-transaction.
+pub fn publish_meta_access_granted(
+    env: &Env,
+    patient: Address,
+    grantee: Address,
+    level: AccessLevel,
+    relayer: Address,
+    expires_at: u64,
+    nonce: u64,
+) {
+    let topics = (symbol_short!("META_GRT"), patient.clone(), grantee.clone());
+    let data = MetaAccessGrantedEvent {
+        patient,
+        grantee,
+        level,
+        relayer,
+        expires_at,
+        nonce,
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
+
+/// Event published when consent is granted by a patient.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsentGrantedEvent {
+    pub patient: Address,
+    pub grantee: Address,
+    pub consent_type: crate::ConsentType,
+    pub expires_at: u64,
+    pub timestamp: u64,
+}
+
+/// Event published when consent is revoked by a patient.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsentRevokedEvent {
+    pub patient: Address,
+    pub grantee: Address,
+    pub timestamp: u64,
+}
+
+/// Publishes an event when consent is granted.
+pub fn publish_consent_granted(
+    env: &Env,
+    patient: Address,
+    grantee: Address,
+    consent_type: crate::ConsentType,
+    expires_at: u64,
+) {
+    let topics = (symbol_short!("CST_GRT"), patient.clone(), grantee.clone());
+    let data = ConsentGrantedEvent {
+        patient,
+        grantee,
+        consent_type,
+        expires_at,
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(topics, data);
+}
+
+/// Publishes an event when consent is revoked.
+pub fn publish_consent_revoked(env: &Env, patient: Address, grantee: Address) {
+    let topics = (symbol_short!("CST_REV"), patient.clone(), grantee.clone());
+    let data = ConsentRevokedEvent {
+        patient,
+        grantee,
         timestamp: env.ledger().timestamp(),
     };
     env.events().publish(topics, data);

@@ -102,18 +102,8 @@ pub enum ContractError {
     ContractPaused = 23,
     InsufficientPermissions = 24,
     TransientFailure = 25,
-    EmergencyAccessNotFound = 26,
-    EmergencyAccessExpired = 27,
-    EmergencyAccessRevoked = 28,
-    InvalidEmergencyCondition = 29,
-    InvalidAttestation = 30,
-    EmergencyAccessDenied = 31,
-    AppointmentNotFound = 32,
-    AppointmentAlreadyExists = 33,
-    InvalidAppointmentTime = 34,
-    AppointmentCannotBeModified = 35,
-    InvalidAppointmentStatus = 36,
-    AppointmentNotVerified = 37,
+    MetaTxExpired = 26,
+    NonceAlreadyUsed = 27,
 }
 
 impl ContractError {
@@ -131,15 +121,13 @@ impl ContractError {
             | ContractError::InvalidDataHash
             | ContractError::InvalidRecordType
             | ContractError::InvalidVerificationStatus
-            | ContractError::InvalidEmergencyCondition
-            | ContractError::InvalidAttestation
-            | ContractError::InvalidAppointmentTime
-            | ContractError::InvalidAppointmentStatus => ErrorCategory::Validation,
+            | ContractError::MetaTxExpired => ErrorCategory::Validation,
             ContractError::Unauthorized
             | ContractError::AccessDenied
             | ContractError::InsufficientPermissions
             | ContractError::ExpiredAccess
-            | ContractError::EmergencyAccessDenied => ErrorCategory::Authorization,
+            | ContractError::ConsentRequired
+            | ContractError::ConsentExpired => ErrorCategory::Authorization,
             ContractError::UserNotFound
             | ContractError::RecordNotFound
             | ContractError::ProviderNotFound
@@ -148,10 +136,7 @@ impl ContractError {
             ContractError::ProviderAlreadyRegistered
             | ContractError::DuplicateRecord
             | ContractError::DelegationExpired
-            | ContractError::EmergencyAccessExpired
-            | ContractError::EmergencyAccessRevoked
-            | ContractError::AppointmentAlreadyExists
-            | ContractError::AppointmentCannotBeModified => ErrorCategory::StateConflict,
+            | ContractError::NonceAlreadyUsed => ErrorCategory::StateConflict,
             ContractError::StorageError => ErrorCategory::Storage,
             ContractError::TransientFailure | ContractError::RateLimitExceeded => {
                 ErrorCategory::Transient
@@ -183,8 +168,7 @@ impl ContractError {
             | ContractError::RecordNotFound
             | ContractError::ProviderNotFound
             | ContractError::DuplicateRecord
-            | ContractError::EmergencyAccessNotFound
-            | ContractError::AppointmentNotFound => ErrorSeverity::Low,
+            | ContractError::MetaTxExpired => ErrorSeverity::Low,
             ContractError::Unauthorized
             | ContractError::AccessDenied
             | ContractError::InsufficientPermissions
@@ -192,12 +176,7 @@ impl ContractError {
             | ContractError::ProviderAlreadyRegistered
             | ContractError::DelegationExpired
             | ContractError::RateLimitExceeded
-            | ContractError::EmergencyAccessExpired
-            | ContractError::EmergencyAccessRevoked
-            | ContractError::EmergencyAccessDenied
-            | ContractError::AppointmentAlreadyExists
-            | ContractError::AppointmentCannotBeModified
-            | ContractError::AppointmentNotVerified => ErrorSeverity::Medium,
+            | ContractError::NonceAlreadyUsed => ErrorSeverity::Medium,
             ContractError::StorageError | ContractError::TransientFailure => ErrorSeverity::High,
             ContractError::Paused | ContractError::ContractPaused => ErrorSeverity::Critical,
         }
@@ -243,22 +222,8 @@ impl ContractError {
             ContractError::ContractPaused => "Contract is paused",
             ContractError::InsufficientPermissions => "Insufficient permissions for operation",
             ContractError::TransientFailure => "Transient failure, operation may succeed on retry",
-            ContractError::EmergencyAccessNotFound => "Emergency access not found",
-            ContractError::EmergencyAccessExpired => "Emergency access has expired",
-            ContractError::EmergencyAccessRevoked => "Emergency access has been revoked",
-            ContractError::InvalidEmergencyCondition => "Invalid emergency condition specified",
-            ContractError::InvalidAttestation => {
-                "Invalid or missing attestation for emergency access"
-            }
-            ContractError::EmergencyAccessDenied => "Emergency access denied",
-            ContractError::AppointmentNotFound => "Appointment not found",
-            ContractError::AppointmentAlreadyExists => "Appointment already exists",
-            ContractError::InvalidAppointmentTime => "Invalid appointment time specified",
-            ContractError::AppointmentCannotBeModified => {
-                "Appointment cannot be modified in current state"
-            }
-            ContractError::InvalidAppointmentStatus => "Invalid appointment status specified",
-            ContractError::AppointmentNotVerified => "Appointment has not been verified",
+            ContractError::MetaTxExpired => "Meta-transaction has expired",
+            ContractError::NonceAlreadyUsed => "Nonce has already been used",
         }
     }
 }
