@@ -22,7 +22,8 @@ fn test_valid_proof_verification_and_audit() {
     // Create a mock valid proof (first byte must be 1 for a and c, pi[0] = 1)
     let mut proof_a = [0u8; 64];
     proof_a[0] = 1;
-    let proof_b = [0u8; 128];
+    let mut proof_b = [0u8; 128];
+    proof_b[0] = 1; // non-zero so it passes degenerate check
     let mut proof_c = [0u8; 64];
     proof_c[0] = 1;
     let mut pi = [0u8; 32];
@@ -65,9 +66,12 @@ fn test_invalid_proof_verification() {
     let user = Address::generate(&env);
     let resource_id = [3u8; 32];
 
-    // Create an invalid proof (first byte is 0 for a)
-    let proof_a = [0u8; 64];
-    let proof_b = [0u8; 128];
+    // Create an invalid proof (first byte is 0 for a, but non-zero elsewhere
+    // so it isn't degenerate)
+    let mut proof_a = [0u8; 64];
+    proof_a[1] = 0xff; // non-zero byte so not degenerate, but a[0]!=1 → verification fails
+    let mut proof_b = [0u8; 128];
+    proof_b[0] = 1;
     let mut proof_c = [0u8; 64];
     proof_c[0] = 1;
     let mut pi = [0u8; 32];
