@@ -52,8 +52,24 @@ pub struct AccessRevokedEvent {
     pub timestamp: u64,
 }
 
-/// Publishes an event when the contract is initialized.
-/// This event includes the admin address and initialization timestamp.
+/// Event published when a batch of records is added.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRecordsAddedEvent {
+    pub provider: Address,
+    pub count: u32,
+    pub timestamp: u64,
+}
+
+/// Event published when a batch of access grants is made.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchAccessGrantedEvent {
+    pub patient: Address,
+    pub count: u32,
+    pub timestamp: u64,
+}
+
 pub fn publish_initialized(env: &Env, admin: Address) {
     let topics = (symbol_short!("INIT"),);
     let data = InitializedEvent {
@@ -194,19 +210,17 @@ pub fn publish_provider_verified(
     );
     let data = ProviderVerifiedEvent {
         provider,
-        verifier,
-        status,
+        count,
         timestamp: env.ledger().timestamp(),
     };
     env.events().publish(topics, data);
 }
 
-/// Publishes an event when provider information is updated.
-/// This event includes the provider address and update timestamp.
-pub fn publish_provider_updated(env: &Env, provider: Address) {
-    let topics = (symbol_short!("PROV_UPD"), provider.clone());
-    let data = ProviderUpdatedEvent {
-        provider,
+pub fn publish_batch_access_granted(env: &Env, patient: Address, count: u32) {
+    let topics = (symbol_short!("BATCH_A"), patient.clone());
+    let data = BatchAccessGrantedEvent {
+        patient,
+        count,
         timestamp: env.ledger().timestamp(),
     };
     env.events().publish(topics, data);
